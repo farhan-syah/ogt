@@ -8,28 +8,38 @@
 
 use std::path::Path;
 
-/// Rotate old fold files: keep only the newest `max_files` (by filename,
-/// which sorts chronologically — see the `{epoch}_{slug}.log` format),
-/// delete the rest.
-pub(crate) fn cleanup_old_files(dir: &Path, max_files: usize) {
-    let keep = max_files.max(1);
-
+/// Rotate old fold files: keep every file named in `current`, plus only the
+/// newest `max_files` of the rest, and delete what is left over. `current`
+/// counts toward `max_files`.
+///
+/// `current` names the files the calling invocation just wrote. They are never
+/// deleted, because the filename is not a reliable creation order: a name freed
+/// by an earlier rotation is reused, so the file a run just wrote can sort among
+/// the oldest. A non-text stream is read back from its fold file after rotation
+/// runs, so deleting it would lose the output the caller is owed.
+pub(crate) fn cleanup_old_files(dir: &Path, max_files: usize, current: &[&Path]) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .ok()
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+        .filter(|e| !current.iter().any(|c| e.path().as_path() == *c))
         .collect();
 
-    if entries.len() <= keep {
+    // The caller's own files occupy part of the budget. At least one file always
+    // survives, so a `max_files` of 0 cannot empty the directory.
+    let budget = max_files.max(1).saturating_sub(current.len());
+    if entries.len() <= budget {
         return;
     }
 
-    // Sort by filename (which starts with epoch timestamp = chronological).
+    // Sort by filename, which starts with the epoch timestamp. This is only a
+    // coarse order — a reused name sorts by its old position — which is why the
+    // caller's own files are excluded above rather than trusted to sort last.
     entries.sort_by_key(|e| e.file_name());
 
-    let to_remove = entries.len() - keep;
+    let to_remove = entries.len() - budget;
     for entry in entries.iter().take(to_remove) {
         let _ = std::fs::remove_file(entry.path());
     }
@@ -50,7 +60,7 @@ mod tests {
             fs::write(dir.join(&filename), "content").unwrap();
         }
 
-        cleanup_old_files(dir, 20);
+        cleanup_old_files(dir, 20, &[]);
 
         let remaining: Vec<_> = fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(remaining.len(), 20);
@@ -74,7 +84,7 @@ mod tests {
             fs::write(dir.join(format!("{:010}_x.log", i)), "c").unwrap();
         }
 
-        cleanup_old_files(dir, 1);
+        cleanup_old_files(dir, 1, &[]);
 
         assert!(dir.join("notes.txt").exists());
     }
@@ -87,10 +97,35 @@ mod tests {
             fs::write(dir.join(format!("{:010}_x.log", i)), "c").unwrap();
         }
 
-        cleanup_old_files(dir, 0);
+        cleanup_old_files(dir, 0, &[]);
 
         // Floored to keep(1): the newest file (highest epoch prefix) survives.
         assert!(dir.join("0000000004_x.log").exists());
+        let remaining: Vec<_> = fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    /// A name freed by an earlier rotation is reused, so a file written this
+    /// moment can carry a name that sorts among the oldest. Rotation must keep
+    /// it anyway: a non-text stream is read back out of its file afterwards, and
+    /// deleting it there loses the caller's output.
+    #[test]
+    fn never_deletes_a_file_the_caller_still_holds() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir = tmpdir.path();
+        // `-1` sorts BELOW the unsuffixed name, so a name-only rule would delete
+        // it first even though it is the file the caller just wrote.
+        let current = dir.join("0000000000_sh.out-1.log");
+        fs::write(&current, "the caller's own output").unwrap();
+        fs::write(dir.join("0000000001_sh.out.log"), "an older file").unwrap();
+
+        cleanup_old_files(dir, 1, &[current.as_path()]);
+
+        assert!(current.exists(), "the caller's own file must survive");
+        assert!(
+            !dir.join("0000000001_sh.out.log").exists(),
+            "the budget is spent on the caller's file, so the other is the one removed"
+        );
         let remaining: Vec<_> = fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(remaining.len(), 1);
     }

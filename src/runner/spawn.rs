@@ -122,9 +122,26 @@ pub(crate) fn run_with(
     // Rotate once, after both fold files are complete: `cleanup_old_files`
     // deletes the oldest files, so running it while the other stream is still
     // writing could delete a file that is still being filled.
-    let folded = out_capture.is_folded() || err_capture.is_folded();
-    if folded && let Some(dir) = dir.as_deref() {
-        cleanup_old_files(dir, cfg.max_files);
+    //
+    // Keyed on a spill, not on a fold: a non-text stream writes a fold file
+    // without summarising it, and that file must be rotated like any other or
+    // binary-only runs accumulate them without bound.
+    //
+    // Both streams' files are passed as the ones to keep: a non-text stream is
+    // read back out of its file after this point, so rotation must not take it.
+    {
+        let mut current: Vec<&Path> = Vec::new();
+        if let Some(path) = out_capture.fold_path() {
+            current.push(path);
+        }
+        if let Some(path) = err_capture.fold_path() {
+            current.push(path);
+        }
+        if !current.is_empty()
+            && let Some(dir) = dir.as_deref()
+        {
+            cleanup_old_files(dir, cfg.max_files, &current);
+        }
     }
 
     // Read the captures' sizes and paths before `emit` consumes them — this
@@ -385,8 +402,7 @@ mod tests {
     /// THE REGRESSION. The gate is a size gate, so a binary stream larger than
     /// the threshold used to take the fold path — and `Fold::render` returns a
     /// `String`, so it decoded as UTF-8 and replaced every invalid byte with
-    /// U+FFFD. Measured 2026-09-24: a 129,292-byte PNG came back as 16,124
-    /// mangled bytes, and the mangled bytes contained `efbfbd`.
+    /// U+FFFD.
     ///
     /// The sibling test above asserts the fold FILE keeps the bytes exactly,
     /// which was always true and is why this went unnoticed: the file was fine
@@ -458,9 +474,10 @@ mod tests {
         assert!(printed.contains("[full output: "), "got: {printed}");
     }
 
-    /// A NUL byte is binary on its own, even when the rest decodes as UTF-8.
-    /// Valid UTF-8 text contains no NUL, and a leading one is the conventional
-    /// binary-file signature, so it must not reach the renderer.
+    /// A NUL byte marks the stream non-text on its own, even when the rest
+    /// decodes as UTF-8. NUL is legal UTF-8, so this is the tool's binary
+    /// heuristic: text output does not carry one, and a leading NUL is the
+    /// conventional signature of a binary file.
     #[test]
     #[cfg(unix)]
     fn a_nul_byte_alone_marks_the_stream_binary() {
@@ -483,15 +500,10 @@ mod tests {
         assert!(out.contains(&0), "the NUL byte must survive");
     }
 
-    /// The bytes ON DISK were never the problem — this test passed throughout
-    /// the defect, which is exactly why the defect survived. It is kept for that
-    /// half of the contract, with the capture type corrected, and the caller's
-    /// stream is asserted separately by
+    /// The bytes ON DISK were never the problem, which is why this test passed
+    /// throughout the defect. It is kept for that half of the contract, with the
+    /// capture type corrected; the caller's stream is asserted separately by
     /// `binary_above_the_gate_reaches_the_caller_byte_for_byte`.
-    ///
-    /// Caught in CI, not locally: this test is `#[cfg(unix)]`, so a Windows
-    /// `cargo test` compiles it out and cannot exercise it. Worth remembering
-    /// before trusting a green run on one platform.
     #[test]
     #[cfg(unix)]
     fn binary_run_persists_invalid_utf8_exactly_on_disk() {
@@ -536,6 +548,78 @@ mod tests {
             std::fs::read(&spilled[0]).unwrap(),
             expected,
             "the spilled file must hold every byte exactly"
+        );
+    }
+
+    /// A stream can start as text and turn non-text later. The gate opens on the
+    /// text prefix, so the decision must be revisited on every later read — and
+    /// the whole stream must still reach the caller byte for byte.
+    #[test]
+    #[cfg(unix)]
+    fn binary_after_the_gate_reaches_the_caller_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        // 40k text lines cross the gate, then two non-text bytes arrive.
+        let outcome = run_with(
+            sh(r"seq 1 40000 | sed 's/^/line /'; printf '\377\000'"),
+            &cfg(tmp.path(), 100),
+            &no_track(),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+
+        let mut expected = big_lines().into_bytes();
+        expected.extend_from_slice(b"\xff\x00");
+
+        assert!(
+            matches!(outcome.stdout, FoldOutcome::Passthrough),
+            "a stream that turns non-text after the gate must not be summarised"
+        );
+        assert_eq!(out, expected, "every byte must reach the caller");
+        assert!(
+            !out.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]),
+            "the output contains U+FFFD, so it went through a UTF-8 decode"
+        );
+        assert!(err.is_empty());
+    }
+
+    /// A non-text stream spills a file without folding, so rotation must key on
+    /// the spill. Keyed on the fold it never ran here, and binary-only runs
+    /// accumulated files past `max_files` without bound.
+    #[test]
+    #[cfg(unix)]
+    fn binary_only_runs_rotate_their_spill_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let bounded = FoldConfig {
+            max_files: 3,
+            ..cfg(tmp.path(), 100)
+        };
+
+        for _ in 0..6 {
+            // Binary above the gate: spills, never folds.
+            run_with(
+                sh(r"i=0; while [ $i -lt 4000 ]; do printf '\377\376\200\001abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuv\n'; i=$((i+1)); done"),
+                &bounded,
+                &no_track(),
+                &mut out,
+                &mut err,
+            )
+            .unwrap();
+        }
+
+        let logs = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+            .count();
+        assert_eq!(
+            logs, 3,
+            "six binary-only runs must rotate down to max_files"
         );
     }
 

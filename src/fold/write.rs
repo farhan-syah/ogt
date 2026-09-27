@@ -100,7 +100,7 @@ pub(crate) fn write_fold_file(
     let (mut file, filepath) = open_fold_file(command_slug, fold_dir)?;
     file.write_all(raw)?;
 
-    cleanup_old_files(fold_dir, max_files);
+    cleanup_old_files(fold_dir, max_files, &[filepath.as_path()]);
 
     Ok(filepath)
 }
