@@ -39,6 +39,14 @@ pub(crate) enum StreamCapture {
     Passthrough(Vec<u8>),
     /// Crossed the gate: full output is on disk, this is the summary of it.
     Folded(Fold),
+    /// Crossed the gate but is NOT text, so no summary was made. Every byte is
+    /// on disk at `Fold::path` and is written to the real fd unchanged.
+    ///
+    /// The gate is a SIZE gate, and a fold renders through a `String`, which
+    /// decodes as UTF-8 and substitutes U+FFFD for each invalid byte. That is
+    /// correct for text and destructive for anything else, so a non-text stream
+    /// must never take the `Folded` path.
+    BinaryPassthrough(Fold),
 }
 
 impl StreamCapture {
@@ -49,6 +57,7 @@ impl StreamCapture {
         match self {
             StreamCapture::Passthrough(bytes) => bytes.len(),
             StreamCapture::Folded(fold) => fold.raw_bytes,
+            StreamCapture::BinaryPassthrough(fold) => fold.raw_bytes,
         }
     }
 
@@ -58,6 +67,8 @@ impl StreamCapture {
         match self {
             StreamCapture::Passthrough(bytes) => bytes.len(),
             StreamCapture::Folded(fold) => fold.kept_bytes,
+            // Every byte reaches the caller; nothing was summarised.
+            StreamCapture::BinaryPassthrough(fold) => fold.raw_bytes,
         }
     }
 
@@ -65,12 +76,64 @@ impl StreamCapture {
         matches!(self, StreamCapture::Folded(_))
     }
 
-    /// Path to the full output on disk, if this stream folded.
+    /// Path to the full output on disk, if this stream crossed the gate.
     pub(crate) fn fold_path(&self) -> Option<&std::path::Path> {
         match self {
             StreamCapture::Passthrough(_) => None,
             StreamCapture::Folded(fold) => Some(&fold.path),
+            StreamCapture::BinaryPassthrough(fold) => Some(&fold.path),
         }
+    }
+}
+
+/// Incremental check for a stream that cannot be rendered as text.
+///
+/// A fold's summary goes through `Fold::render`, which returns a `String`, so
+/// the fold path lossily decodes its input: every invalid byte becomes U+FFFD.
+/// A stream is safe to fold only while every byte of it is valid UTF-8.
+///
+/// The check is incremental because a code point can be split across two reads.
+/// Only an incomplete sequence at the very end of the bytes seen so far is
+/// deferred; an invalid sequence inside them is final, and once one is found the
+/// stream is non-text for the rest of its life.
+///
+/// A NUL byte marks the stream non-text on its own. NUL is legal UTF-8, so this
+/// is this tool's binary heuristic rather than a decoding rule: text output does
+/// not carry one, and a leading NUL is the conventional signature of a binary
+/// file.
+#[derive(Default)]
+struct BinaryScan {
+    /// Trailing bytes of a code point the next read may complete. At most three.
+    pending: Vec<u8>,
+}
+
+impl BinaryScan {
+    /// Feed one chunk. Returns `true` once the stream is known not to be text.
+    fn update(&mut self, chunk: &[u8]) -> bool {
+        if chunk.contains(&0) {
+            return true;
+        }
+
+        // Judge the carried bytes together with this chunk: the first bytes here
+        // may complete a code point the previous read cut in half, and
+        // validating them alone would call valid text invalid.
+        let carried = !self.pending.is_empty();
+        if carried {
+            self.pending.extend_from_slice(chunk);
+        }
+        let subject: &[u8] = if carried { &self.pending } else { chunk };
+
+        let decided = match std::str::from_utf8(subject) {
+            Ok(_) => subject.len(),
+            // An invalid sequence inside the bytes already seen is final.
+            Err(err) if err.error_len().is_some() => return true,
+            // Incomplete at the end: hold it back for the next read.
+            Err(err) => err.valid_up_to(),
+        };
+
+        let unfinished = subject[decided..].to_vec();
+        self.pending = unfinished;
+        false
     }
 }
 
@@ -101,6 +164,13 @@ pub(crate) struct StreamSink {
     head: Vec<u8>,
     /// Trailing window, bounded by `TAIL_RING_MAX`.
     tail: Vec<u8>,
+    /// Set once any byte seen is not text. The stream still spills, so memory
+    /// stays bounded, but it is reported as `BinaryPassthrough` and never
+    /// rendered as a summary.
+    binary: bool,
+    /// Text check carried across reads, so a code point split between two of
+    /// them is not mistaken for invalid UTF-8.
+    scan: BinaryScan,
 }
 
 impl StreamSink {
@@ -122,6 +192,8 @@ impl StreamSink {
             last_byte: None,
             head: Vec::new(),
             tail: Vec::new(),
+            binary: false,
+            scan: BinaryScan::default(),
         }
     }
 
@@ -139,10 +211,28 @@ impl StreamSink {
         let crossed = match &mut self.state {
             State::Buffering(buf) => {
                 buf.extend_from_slice(chunk);
-                self.enabled && estimate_tokens_len(self.raw_bytes) >= self.threshold_tokens
+                if self.enabled
+                    && !self.binary
+                    && estimate_tokens_len(self.raw_bytes) >= self.threshold_tokens
+                {
+                    // Crossing commits the stream to a fold, and a fold renders
+                    // through a `String`. Inspect the buffered prefix HERE, the
+                    // one moment it is still in memory: after spilling, only a
+                    // byte count and a bounded tail ring survive.
+                    self.binary = self.scan.update(buf);
+                    true
+                } else {
+                    false
+                }
             }
             State::Spilling(writer) => {
                 writer.write_all(chunk)?;
+                // Keep checking after the gate: a stream can start as text and
+                // turn non-text later, and the decision holds only until the
+                // last read is in.
+                if !self.binary {
+                    self.binary = self.scan.update(chunk);
+                }
                 self.tail.extend_from_slice(chunk);
                 trim_tail(&mut self.tail);
                 false
@@ -207,13 +297,21 @@ impl StreamSink {
                 let path = self
                     .path
                     .ok_or_else(|| io::Error::other("spilled stream has no fold file path"))?;
-                Ok(StreamCapture::Folded(Fold::from_regions(
+                let fold = Fold::from_regions(
                     &self.head,
                     &self.tail,
                     total_lines_from(self.newlines, self.last_byte),
                     self.raw_bytes,
                     path,
-                )))
+                );
+                // A non-text stream is handed back whole rather than summarised.
+                // The `Fold` still carries the path, so the bytes remain on disk
+                // and `emit` can stream them to the real fd.
+                if self.binary {
+                    Ok(StreamCapture::BinaryPassthrough(fold))
+                } else {
+                    Ok(StreamCapture::Folded(fold))
+                }
             }
         }
     }
@@ -264,6 +362,9 @@ mod tests {
         match capture {
             StreamCapture::Passthrough(bytes) => assert_eq!(bytes, raw),
             StreamCapture::Folded(_) => panic!("must not fold below the gate"),
+            StreamCapture::BinaryPassthrough(_) => {
+                panic!("must not cross the gate below it, text or not")
+            }
         }
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
@@ -352,15 +453,34 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_spills_losslessly_and_previews_lossily() {
+    fn invalid_utf8_is_not_folded_at_all() {
         let tmp = tempfile::tempdir().unwrap();
         let mut raw = Vec::new();
         for i in 0..20_000 {
             raw.extend_from_slice(&[0xff, 0xfe, b'a' + (i % 26) as u8, b'\n']);
         }
         let capture = sink(tmp.path(), 100).pump(&raw[..]).unwrap();
-        let StreamCapture::Folded(fold) = capture else {
-            panic!("expected a fold");
+
+        // A non-text stream must not take the fold path: `render` returns a
+        // `String`, so it would decode as UTF-8 and turn every 0xff/0xfe here
+        // into U+FFFD. The bytes on disk were always exact, which is why only
+        // the printed stream was ever wrong.
+        assert!(
+            matches!(capture, StreamCapture::BinaryPassthrough(_)),
+            "invalid UTF-8 above the gate must not take the fold path"
+        );
+        assert!(
+            !capture.is_folded(),
+            "a binary stream must not be reported as folded"
+        );
+        assert_eq!(
+            capture.kept_bytes(),
+            capture.raw_bytes(),
+            "every byte must reach the caller, so kept equals raw"
+        );
+
+        let StreamCapture::BinaryPassthrough(fold) = capture else {
+            unreachable!("just asserted");
         };
         assert_eq!(
             std::fs::read(&fold.path).unwrap(),
@@ -369,6 +489,94 @@ mod tests {
         );
         assert!(fold.head.len() <= SLICE_MAX_BYTES);
         assert!(fold.tail.len() <= SLICE_MAX_BYTES);
+    }
+
+    /// A code point split between two reads must not be mistaken for invalid
+    /// UTF-8. `é` is `0xC3 0xA9`; when the gate opens with only its lead byte
+    /// received, `from_utf8` reports an incomplete sequence, and the whole text
+    /// stream would be misclassified as non-text.
+    #[test]
+    fn a_code_point_split_at_the_gate_stays_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = sink(tmp.path(), 100);
+
+        // 400 ASCII bytes put the running total exactly at the gate (100 tokens
+        // = 400 bytes), so the crossing read ends on the split lead byte.
+        let mut first = vec![b'a'; 400];
+        first.push(0xC3);
+        s.feed(&first).unwrap();
+        assert!(matches!(s.state, State::Spilling(_)), "must have spilled");
+
+        // The continuation byte arrives in the next read and completes the code
+        // point; everything after it is plain ASCII.
+        let mut second = vec![0xA9];
+        second.extend(std::iter::repeat_n(b'b', 40_000));
+        s.feed(&second).unwrap();
+
+        let capture = s.finish().unwrap();
+        assert!(
+            matches!(capture, StreamCapture::Folded(_)),
+            "a valid text stream must fold even when a code point is split across reads"
+        );
+    }
+
+    /// The same split, once the stream is already spilling: the reads after the
+    /// gate need the same carried-byte handling as the crossing read.
+    #[test]
+    fn a_code_point_split_while_spilling_stays_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = sink(tmp.path(), 100);
+        s.feed(&vec![b'a'; 40_000]).unwrap();
+
+        s.feed(&[0xC3]).unwrap();
+        let mut rest = vec![0xA9];
+        rest.extend(std::iter::repeat_n(b'b', 40_000));
+        s.feed(&rest).unwrap();
+
+        let capture = s.finish().unwrap();
+        assert!(
+            matches!(capture, StreamCapture::Folded(_)),
+            "a split code point after the gate must not disable folding either"
+        );
+    }
+
+    /// The gate decides on a prefix, but a stream can turn non-text later. The
+    /// decision must be revisited on every read, or a text-then-binary stream is
+    /// summarised through `render` and its tail is destroyed.
+    #[test]
+    fn binary_after_the_gate_is_still_caught() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = sink(tmp.path(), 100);
+
+        // Text first: the gate opens and the stream commits to a fold.
+        let text = vec![b'a'; 40_000];
+        s.feed(&text).unwrap();
+        assert!(!s.binary, "text alone must not mark the stream non-text");
+
+        // Then bytes that are not text at all.
+        s.feed(&[0xff, 0x00]).unwrap();
+
+        let capture = s.finish().unwrap();
+        assert!(
+            matches!(capture, StreamCapture::BinaryPassthrough(_)),
+            "a stream that turns non-text after the gate must not be rendered"
+        );
+        assert_eq!(
+            capture.kept_bytes(),
+            capture.raw_bytes(),
+            "every byte must reach the caller, so kept equals raw"
+        );
+
+        let StreamCapture::BinaryPassthrough(fold) = capture else {
+            unreachable!("just asserted");
+        };
+        let mut expected = text;
+        expected.extend_from_slice(&[0xff, 0x00]);
+        assert_eq!(
+            std::fs::read(&fold.path).unwrap(),
+            expected,
+            "the spill file must hold the whole stream, text and trailing bytes alike"
+        );
     }
 
     #[test]
@@ -418,6 +626,9 @@ mod tests {
         match capture {
             StreamCapture::Passthrough(bytes) => assert!(bytes.is_empty()),
             StreamCapture::Folded(_) => panic!("empty stream must not fold"),
+            StreamCapture::BinaryPassthrough(_) => {
+                panic!("an empty stream is text, and must not spill at all")
+            }
         }
     }
 }

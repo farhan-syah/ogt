@@ -21,6 +21,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
   its own shim, and every PATH shim failed with
   `%1 is not a valid Win32 application. (os error 193)`. The shim now rewrites
   `OGT_SHIM_DIR` through `cygpath -w` when `cygpath` is available, which is a no-op on Unix.
+- Never fold a stream that is not text. A stream containing a NUL byte or invalid UTF-8 was
+  decoded as UTF-8, so invalid bytes reached the caller as U+FFFD and any pipeline consuming
+  the output broke silently. Such a stream now passes through unchanged.
 
 ## [0.1.0] - 2026-08-31
 
